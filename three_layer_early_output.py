@@ -13,15 +13,14 @@ class ThreeLayerCNN(nn.Module):
     def __init__(self):
         super(ThreeLayerCNN, self).__init__()
         self.c1 = nn.Conv2d(1, 50, 3, 1)
-        self.c2 = nn.Conv2d(20, 50, 3, 1)
+        self.c2 = nn.Conv2d(50, 50, 3, 1)
         self.c3 = nn.Conv2d(50, 50, 3, 1)
 
         self.linear1 = nn.Linear(50, 500)
         self.linear2 = nn.Linear(500, 10)
 
-        self.decide1 = nn.Linear(20*13*13, 3)
-
-
+        self.decide1 = nn.Linear(50 * 13 * 13, 3)
+        self.decide2 = nn.Linear(50 * 5 * 5, 2)
 
     def forward(self, x):
         x = F.relu(self.c1(x))
@@ -30,40 +29,78 @@ class ThreeLayerCNN(nn.Module):
         # compute an intermediary vector to decide
         # options: c2, c3, output
 
-        iview = x.view(-1, 20*13*13)
+        iview = x.view(-1, 50*13*13)
         iview = self.decide1(iview)
         decisions1 = torch.max(iview, dim=1)[1] # gets which of the three paths  to take
 
-        c2 = x[[(decisions1 == 0).nonzero()]]  # picking out ones to be convolved at c2
-        c3 = x[[(decisions1 == 1).nonzero()]]  # picking out ones to be convolved at c3
-        l1 = x[[(decisions1 == 2).nonzero()]]  # picking out ones to be run throuhg the linear layer
+        c2_idx = (decisions1 == 0).nonzero().numpy().flatten().tolist()
+        c3_idx = (decisions1 == 1).nonzero().numpy().flatten().tolist()
+        l11_idx = (decisions1 == 2).nonzero().numpy().flatten().tolist()
+
+        c2 = x[c2_idx]  # picking out ones to be convolved at c2 - must keep track so we can permute labels later
+        c3 = x[c3_idx]  # picking out ones to be convolved at c3
+        l11 = x[l11_idx]  # picking out ones to be run through the linear layer
 
         #removing extra dim
         if (c2.size(0) > 0):
             c2 = c2.squeeze(dim=1)
         if (c3.size(0) > 0):
             c3 = c3.squeeze(dim=1)
-        if (l1.size(0) > 0):
-            l1 = l1.squeeze(dim=1)
+        if (l11.size(0) > 0):
+            l11 = l11.squeeze(dim=1)
+            l11 = F.max_pool2d(l11, 7, 7)
 
-        x = F.relu(self.c2(x))
-        x = F.max_pool2d(x, 2, 2)
+        c2 = F.relu(self.c2(c2))
+        c2 = F.max_pool2d(c2, 2, 2)
 
-        print(F.max_pool2d(c3, 3, 3, padding=1).size())
+        #split for c3 and l1
+        iview = c2.view(-1, 50*5*5)
+        iview = self.decide2(iview)
+        decisions2 = torch.max(iview, dim=1)[1]
+
+        c32_idx = (decisions2 == 0).nonzero().numpy().flatten().tolist()
+        l12_idx = (decisions2 == 1).nonzero().numpy().flatten().tolist()
+
+        real_c32_idx = [c2_idx[i] for i in c32_idx] #c2_idx[c32_idx] #where the real indices have been shuffled to
+        real_l12_idx = [c2_idx[i] for i in l12_idx] #c2_idx[l12_idx]
+
+        c32 = c2[c32_idx]  # picking out ones to be convolved at c2
+        l12 = c2[l12_idx]
+
+        if (c32.size(0) > 0):
+            c32 = c32.squeeze(dim=1)
+        if (l12.size(0) > 0):
+            l12 = l12.squeeze(dim=1)
+            l12 = F.max_pool2d(l12, 3, 3)
+
+        ## combine the c32 with the pooling currently in the print statement below
+
+        c33 = F.max_pool2d(c3, 3, 3, padding=1) #data from the first layer that goes  into c3
+        c3_input = torch.cat((c32,c33))
+
+        real_c3_idx = real_c32_idx + c3_idx
 
         # compute an intermediary vector to decide
         # options: c3, output
 
-        x = F.relu(self.c3(x))
+        c3_output = F.relu(self.c3(c3_input))
 
-        x = F.max_pool2d(x, 2, 2)
-        x = x.view(-1, 50)
+        c3_output = F.max_pool2d(c3_output, 2, 2)
 
+        order = l11_idx + real_l12_idx + real_c3_idx
 
-        x = F.relu(self.linear1(x))
+        holder = [l11, l12, c3_output]
+        holder = [x for x in holder if x.nelement() != 0]
+        c3_output = torch.cat(holder)
+
+        c3_output = c3_output.view(-1, 50)
+
+        ## merge l11 and l12 with the output of c3 to go into the linear layer
+
+        x = F.relu(self.linear1(c3_output))
 
         x = self.linear2(x)
-        return F.log_softmax(x, dim=1)
+        return (F.log_softmax(x, dim=1), order)
 
 def train(args, mod, dev, train_loader, optimizer, epoch):
     mod.train()
@@ -71,8 +108,8 @@ def train(args, mod, dev, train_loader, optimizer, epoch):
     for idx, (data, target) in enumerate(train_loader):
         data, target = data.to(dev), target.to(dev)
         optimizer.zero_grad()
-        output = mod(data)
-        loss = F.nll_loss(output, target)
+        output, order = mod(data)
+        loss = F.nll_loss(output, target[order])
         loss.backward()
         optimizer.step()
         losses.append([epoch*len(train_loader.dataset) + idx, loss.item()])
@@ -89,7 +126,8 @@ def test(args, mod, device, test_loader):
     with torch.no_grad():
         for data, target in test_loader:
             data, target  = data.to(device), target.to(device)
-            output = mod(data)
+            output, order  = mod(data)
+            target = target[order]
             test_loss += F.nll_loss(output, target, reduction='sum').item()
             pred = output.max(1, keepdim=True)[1]
             correct += pred.eq(target.view_as(pred)).sum().item()
@@ -106,7 +144,7 @@ def main():
                         help='batch size for training')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                         help='batch size for testing')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',
+    parser.add_argument('--epochs', type=int, default=40, metavar='N',
                         help='number of training epochs')
     parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                         help='default learning rate 0.01')
