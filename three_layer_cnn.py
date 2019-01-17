@@ -4,9 +4,12 @@ import numpy as np
 import pickle
 import torch.nn.functional as F
 import argparse
-
+import time
+import psutil
+import os
 from torchvision import datasets, transforms
 
+process = psutil.Process(os.getpid())
 #Based on the basic CNN implementation from https://github.com/pytorch/examples/blob/master/mnist/main.py
 
 class ThreeLayerCNN(nn.Module):
@@ -19,6 +22,7 @@ class ThreeLayerCNN(nn.Module):
         self.linear2 = nn.Linear(500, 10)
 
     def forward(self, x):
+        a = time.perf_counter()
         x = F.relu(self.c1(x))
         x = F.max_pool2d(x, 2, 2)
         x = F.relu(self.c2(x))
@@ -28,15 +32,18 @@ class ThreeLayerCNN(nn.Module):
         x = x.view(-1, 50)
         x = F.relu(self.linear1(x))
         x = self.linear2(x)
-        return F.log_softmax(x, dim=1)
+        b = time.perf_counter()
+        return (F.log_softmax(x, dim=1), b-a)
 
 def train(args, mod, dev, train_loader, optimizer, epoch):
     mod.train()
     losses = []
+    tims=[]
     for idx, (data, target) in enumerate(train_loader):
         data, target = data.to(dev), target.to(dev)
         optimizer.zero_grad()
-        output = mod(data)
+        output,tim = mod(data)
+        tims.append(tim)
         loss = F.nll_loss(output, target)
         loss.backward()
         optimizer.step()
@@ -45,7 +52,7 @@ def train(args, mod, dev, train_loader, optimizer, epoch):
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, idx * len(data), len(train_loader.dataset),
                 100. * idx / len(train_loader), loss.item()))
-    return losses
+    return losses, tims
 
 def test(args, mod, device, test_loader):
     mod.eval()
@@ -54,7 +61,7 @@ def test(args, mod, device, test_loader):
     with torch.no_grad():
         for data, target in test_loader:
             data, target  = data.to(device), target.to(device)
-            output = mod(data)
+            output,tim = mod(data)
             test_loss += F.nll_loss(output, target, reduction='sum').item()
             pred = output.max(1, keepdim=True)[1]
             correct += pred.eq(target.view_as(pred)).sum().item()
@@ -71,7 +78,7 @@ def main():
                         help='batch size for training')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                         help='batch size for testing')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',
+    parser.add_argument('--epochs', type=int, default=1, metavar='N',
                         help='number of training epochs')
     parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                         help='default learning rate 0.01')
@@ -115,16 +122,23 @@ def main():
     losses = []
     accuracies = []
     test_losses = []
+    big_times = []
 
     for epoch in range(1, args.epochs+1):
-        loss = train(args, model, device, train_loader, optimizer, epoch)
+        loss,tims = train(args, model, device, train_loader, optimizer, epoch)
         losses.append(loss)
         accuracy, test_loss = test(args, model, device, test_loader)
         accuracies.append(accuracy)
         test_losses.append(test_loss)
+        if len(big_times) == 0:
+            big_times = np.stack((np.repeat(epoch, len(tims)), tims))
+        else:
+            big_times = np.concatenate((big_times, np.stack((np.repeat(epoch, len(tims)), tims))), axis=1)
 
     if (args.save_model):
         torch.save(model.state_dict(), 'basic_mnist_cnn.pt')
+
+    np.savetxt('basic_times.csv', big_times, delimiter=',')
 
     with open('train_losses.pkl', 'wb') as handle:
         pickle.dump(losses, handle)
@@ -132,6 +146,7 @@ def main():
         pickle.dump(accuracies, handle)
     with open('test_losses.pkl', 'wb') as handle:
         pickle.dump(test_losses, handle)
+    print(process.memory_info().rss)
 
 if __name__ == '__main__':
     main()

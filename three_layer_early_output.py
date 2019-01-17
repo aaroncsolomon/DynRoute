@@ -4,8 +4,13 @@ import numpy as np
 import pickle
 import torch.nn.functional as F
 import argparse
+import os
+import psutil
+import time
 
 from torchvision import datasets, transforms
+
+process = psutil.Process(os.getpid())
 
 #Based on the basic CNN implementation from https://github.com/pytorch/examples/blob/master/mnist/main.py
 
@@ -22,12 +27,23 @@ class ThreeLayerCNN(nn.Module):
         self.decide1 = nn.Linear(50 * 13 * 13, 3)
         self.decide2 = nn.Linear(50 * 5 * 5, 2)
 
+        self.c1_c3 = nn.Linear(13,13)
+        self.c1_l1 = nn.Linear(1,500)
+        self.c2_l1 = nn.Linear(5,500)
+
     def forward(self, x):
+
+        l1_start=time.perf_counter()
+
         x = F.relu(self.c1(x))
         x = F.max_pool2d(x, 2, 2)
 
+        l1_end = time.perf_counter()
+
         # compute an intermediary vector to decide
         # options: c2, c3, output
+
+        dl1_start = time.perf_counter()
 
         iview = x.view(-1, 50*13*13)
         iview = self.decide1(iview)
@@ -50,8 +66,18 @@ class ThreeLayerCNN(nn.Module):
             l11 = l11.squeeze(dim=1)
             l11 = F.max_pool2d(l11, 7, 7)
 
+        dl1_end = time.perf_counter()
+
+        c33 = self.c1_c3(c3)
+        l11 = self.c1_l1(l11)
+
+        l2_start = time.perf_counter()
         c2 = F.relu(self.c2(c2))
         c2 = F.max_pool2d(c2, 2, 2)
+
+        l2_end = time.perf_counter()
+
+        dl2_start = time.perf_counter()
 
         #split for c3 and l1
         iview = c2.view(-1, 50*5*5)
@@ -71,11 +97,15 @@ class ThreeLayerCNN(nn.Module):
             c32 = c32.squeeze(dim=1)
         if (l12.size(0) > 0):
             l12 = l12.squeeze(dim=1)
+            l12 = self.c2_l1(l12)
             l12 = F.max_pool2d(l12, 3, 3)
+
+        dl2_end = time.perf_counter()
 
         ## combine the c32 with the pooling currently in the print statement below
 
-        c33 = F.max_pool2d(c3, 3, 3, padding=1) #data from the first layer that goes  into c3
+        l3_start = time.perf_counter()
+
         c3_input = torch.cat((c32,c33))
 
         real_c3_idx = real_c32_idx + c3_idx
@@ -95,21 +125,49 @@ class ThreeLayerCNN(nn.Module):
 
         c3_output = c3_output.view(-1, 50)
 
+
+
         ## merge l11 and l12 with the output of c3 to go into the linear layer
 
         x = F.relu(self.linear1(c3_output))
 
         x = self.linear2(x)
-        return (F.log_softmax(x, dim=1), order)
+
+        l3_end = time.perf_counter()
+        return (F.log_softmax(x, dim=1), order,
+                (l11_idx, c3_idx, real_l12_idx),
+                (l1_end-l1_start, dl1_end-dl1_start, l2_end-l2_start, dl2_end-dl2_start, l3_end-l3_start))
 
 def train(args, mod, dev, train_loader, optimizer, epoch):
     mod.train()
     losses = []
+    l11_samples = []
+    c3_samples = []
+    l12_samples = []
+
+    l1_times = []
+    l2_times = []
+    d1_times = []
+    d2_times = []
+    ot_times = []
+
     for idx, (data, target) in enumerate(train_loader):
         data, target = data.to(dev), target.to(dev)
         optimizer.zero_grad()
-        output, order = mod(data)
+        output, order, swapped, tims= mod(data)
         loss = F.nll_loss(output, target[order])
+        a,b,c = swapped
+        l1t, d1t, l2t, d2t, ot = tims
+        l11_samples = np.concatenate((l11_samples, target[a]), axis=None)
+        c3_samples = np.concatenate((c3_samples, target[b]), axis=None)
+        l12_samples = np.concatenate((l12_samples, target[c]), axis=None)
+
+        l1_times = np.concatenate((l1_times,l1t), axis=None)
+        l2_times = np.concatenate((l2_times,l2t), axis=None)
+        d1_times = np.concatenate((d1_times,d1t), axis=None)
+        d2_times = np.concatenate((d2_times,d2t), axis=None)
+        ot_times = np.concatenate((ot_times,ot), axis=None)
+
         loss.backward()
         optimizer.step()
         losses.append([epoch*len(train_loader.dataset) + idx, loss.item()])
@@ -117,7 +175,7 @@ def train(args, mod, dev, train_loader, optimizer, epoch):
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, idx * len(data), len(train_loader.dataset),
                 100. * idx / len(train_loader), loss.item()))
-    return losses
+    return (losses, (l11_samples, c3_samples, l12_samples), (l1_times, l2_times, d1_times, d2_times, ot_times))
 
 def test(args, mod, device, test_loader):
     mod.eval()
@@ -126,7 +184,7 @@ def test(args, mod, device, test_loader):
     with torch.no_grad():
         for data, target in test_loader:
             data, target  = data.to(device), target.to(device)
-            output, order  = mod(data)
+            output, order, swapped, tims = mod(data)
             target = target[order]
             test_loss += F.nll_loss(output, target, reduction='sum').item()
             pred = output.max(1, keepdim=True)[1]
@@ -144,7 +202,7 @@ def main():
                         help='batch size for training')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                         help='batch size for testing')
-    parser.add_argument('--epochs', type=int, default=40, metavar='N',
+    parser.add_argument('--epochs', type=int, default=1, metavar='N',
                         help='number of training epochs')
     parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                         help='default learning rate 0.01')
@@ -188,16 +246,80 @@ def main():
     losses = []
     accuracies = []
     test_losses = []
+    l11_samples = []
+    c3_samples = []
+    l12_samples = []
+
+    big_l1_times = []
+    big_l2_times = []
+    big_d1_times = []
+    big_d2_times = []
+    big_ot_times = []
 
     for epoch in range(1, args.epochs+1):
-        loss = train(args, model, device, train_loader, optimizer, epoch)
+        (loss, (l11_res, c3_res, l12_res), (l1_times, l2_times, d1_times, d2_times, ot_times)) = train(args, model, device, train_loader, optimizer, epoch)
         losses.append(loss)
         accuracy, test_loss = test(args, model, device, test_loader)
         accuracies.append(accuracy)
         test_losses.append(test_loss)
 
+
+
+        if len(big_l1_times) == 0:
+            big_l1_times = np.stack((np.repeat(epoch, len(l1_times)), l1_times))
+        else:
+            big_l1_times = np.concatenate((big_l1_times, np.stack((np.repeat(epoch, len(l1_times)), l1_times))), axis=1)
+
+        if len(big_l2_times) == 0:
+            big_l2_times = np.stack((np.repeat(epoch, len(l2_times)), l2_times))
+        else:
+            big_l2_times = np.concatenate((big_l2_times, np.stack((np.repeat(epoch, len(l2_times)), l2_times))), axis=1)
+
+        if len(big_d1_times) == 0:
+            big_d1_times = np.stack((np.repeat(epoch, len(d1_times)), d1_times))
+        else:
+            big_d1_times = np.concatenate((big_d1_times, np.stack((np.repeat(epoch, len(d1_times)), d1_times))), axis=1)
+
+        if len(big_d2_times) == 0:
+            big_d2_times = np.stack((np.repeat(epoch, len(d2_times)), d2_times))
+        else:
+            big_d2_times = np.concatenate((big_d2_times, np.stack((np.repeat(epoch, len(d2_times)), d2_times))), axis=1)
+
+        if len(big_ot_times) == 0:
+            big_ot_times = np.stack((np.repeat(epoch, len(ot_times)), ot_times))
+        else:
+            big_ot_times = np.concatenate((big_ot_times, np.stack((np.repeat(epoch, len(ot_times)), ot_times))), axis=1)
+
+
+
+
+        if len(l11_samples) == 0:
+            l11_samples = np.stack((np.repeat(epoch, len(l11_res)), l11_res))
+        else:
+            l11_samples = np.concatenate((l11_samples, np.stack((np.repeat(epoch, len(l11_res)), l11_res))), axis=1)
+
+        if len(c3_samples) == 0:
+            c3_samples = np.stack((np.repeat(epoch, len(c3_res)), c3_res))
+        else:
+            c3_samples = np.concatenate((c3_samples, np.stack((np.repeat(epoch, len(c3_res)), c3_res))), axis=1)
+
+        if len(l12_samples) == 0:
+            l12_samples = np.stack((np.repeat(epoch, len(l12_res)), l12_res))
+        else:
+            l12_samples = np.concatenate((l12_samples, np.stack((np.repeat(epoch, len(l12_res)), l12_res))), axis=1)
+
+    np.savetxt('time_interlayer_l1.csv', big_l1_times, delimiter=',')
+    np.savetxt('time_interlayer_l2.csv', big_l2_times, delimiter=',')
+    np.savetxt('time_interlayer_d1.csv', big_d1_times, delimiter=',')
+    np.savetxt('time_interlayer_d2.csv', big_d2_times, delimiter=',')
+    np.savetxt('time_interlayer_ot.csv', big_ot_times, delimiter=',')
+
+    np.savetxt('interlayer_l11.csv', l11_samples, delimiter=',')
+    np.savetxt('interlayer_c3.csv', c3_samples, delimiter=',')
+    np.savetxt('interlayer_l12.csv', l12_samples, delimiter=',')
+
     if (args.save_model):
-        torch.save(model.state_dict(), 'basic_mnist_cnn.pt')
+        torch.save(model.state_dict(), 'interlayer_mnist_cnn.pt')
 
     with open('train_losses.pkl', 'wb') as handle:
         pickle.dump(losses, handle)
@@ -205,6 +327,11 @@ def main():
         pickle.dump(accuracies, handle)
     with open('test_losses.pkl', 'wb') as handle:
         pickle.dump(test_losses, handle)
+
+    print(process.memory_info().rss)
+
+
+
 
 if __name__ == '__main__':
     main()
